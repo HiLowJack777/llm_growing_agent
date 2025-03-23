@@ -1,2 +1,23 @@
-# llm_growing_agent
- This is a project aimed at creating an agent that perpetually thinks and develops itself. It can add entries into an SQLite database and change the structure of that databaase. It also has the ability to search the web when it needs to. It utilizes OpenAI function calling and the responses API. All that is needed to run it is an OpenAI API key.
+# LLM Growing Agent — A Self-Evolving AI
+
+This project is a **self-reflective AI agent** that thinks, stores its thoughts, evolves its own memory schema, and is interactable in a simple desktop GUI.
+
+It’s designed to be a complete thinking agent with journaling, reflection prompts, SQL schema evolution, and web search capabilities.
+
+## Features
+- Autonomous journaling and reflection
+- Self-evolving memory using SQLite
+- Schema awareness and auto-migration
+- Short-term memory buffer
+- Reflection prompt scoring and strategy evaluation
+- Web search integration using OpenAI `responses` API
+- Simple Tkinter-based GUI interface
+
+## Start
+
+1. **Clone the repo**
+   ```bash
+   git clone https://github.com/your-username/llm_growing_agent.git
+   cd llm_growing_agent
+2. Input your OpenAI API Key.
+3. Create your first agent.

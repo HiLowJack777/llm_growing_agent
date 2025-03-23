@@ -14,9 +14,9 @@ import threading
 console = Console()
 
 class ThinkingAgent:
-    def __init__(self, client):
+    def __init__(self, client, db_path="llm_memory.db"):
         self.client = client
-        self.db_path = "llm_memory.db"
+        self.db_path = db_path
         self.short_term_memory = []  # STM buffer
         self.system_message = {"role": "system", "content": "You are a self-reflective AI agent with the ability to learn and adapt."}
         self.last_tool_results = []
@@ -25,6 +25,9 @@ class ThinkingAgent:
         # Add table for storing reflection strategies
         self.initialize_reflection_table()
         self.initialize_thought_tables()
+        self.initialize_agent_identity()
+        # Load existing identity if available
+        self.load_active_identity()
 
     def initialize_database(self):
         conn = sqlite3.connect(self.db_path)
@@ -80,6 +83,53 @@ class ThinkingAgent:
         """)
         conn.commit()
         conn.close()
+
+    def initialize_agent_identity(self):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS agent_identity (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            purpose TEXT NOT NULL,
+            personality TEXT,
+            goals TEXT,
+            constraints TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            is_active BOOLEAN DEFAULT 1
+        )
+        """)
+        conn.commit()
+        conn.close()
+
+    def load_active_identity(self):
+        """Load the currently active identity configuration"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+        SELECT purpose, personality, goals, constraints 
+        FROM agent_identity 
+        WHERE is_active = 1 
+        ORDER BY created_at DESC 
+        LIMIT 1
+        """)
+        identity = cursor.fetchone()
+        conn.close()
+
+        if identity:
+            purpose, personality, goals, constraints = identity
+            self.system_message = {
+                "role": "system",
+                "content": f"""You are a self-reflective AI agent.
+                Primary Purpose: {purpose}
+                
+                Personality: {personality if personality else 'Analytical and thoughtful'}
+                Goals: {goals if goals else 'Continuously learn and improve'}
+                Constraints: {constraints if constraints else 'Act ethically and responsibly'}
+                
+                Always work towards your defined purpose while maintaining your specified characteristics."""
+            }
+            return True
+        return False
 
     def update_short_term_memory(self, speaker, message):
         self.short_term_memory.append({"speaker": speaker, "message": message})
@@ -184,6 +234,26 @@ class ThinkingAgent:
                 "error": str(e)
             }
 
+    def make_openai_call(self, messages, tools=None):
+        """Helper method to standardize OpenAI API calls"""
+        try:
+            if tools:
+                response = self.client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=messages,
+                    tools=tools,
+                    tool_choice="auto"
+                )
+            else:
+                response = self.client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=messages
+                )
+            return response
+        except Exception as e:
+            console.print(f"[red]Error in OpenAI API call: {str(e)}[/red]")
+            return None
+
     def generate_reflection_prompt(self):
         # First, get recent thoughts
         conn = sqlite3.connect(self.db_path)
@@ -225,11 +295,10 @@ class ThinkingAgent:
             """}
         ]
 
-        response = self.client.chat.completions.create(
-            model="gpt-4o",
-            messages=messages
-        )
-
+        response = self.make_openai_call(messages)
+        if not response:
+            return "Failed to generate reflection prompt"
+        
         generated_prompt = response.choices[0].message.content
 
         # Store the generated prompt
@@ -351,13 +420,10 @@ class ThinkingAgent:
         # Reset tool results for this iteration
         self.last_tool_results = []
 
-        response = self.client.chat.completions.create(
-            model="gpt-4o",
-            messages=messages,
-            tools=tools,
-            tool_choice="auto"
-        )
-
+        response = self.make_openai_call(messages, tools=tools)
+        if not response:
+            return "Failed to process thought"
+        
         message = response.choices[0].message
         formatted_response = ""
         stored_something = False  # Track if we've stored anything
@@ -441,13 +507,12 @@ class ThinkingAgent:
             """}
         ]
 
-        response = self.client.chat.completions.create(
-            model="gpt-4o",
-            messages=messages
-        )
-
+        api_response = self.make_openai_call(messages)
+        if not api_response:
+            return
+        
         try:
-            score = float(response.choices[0].message.content.strip())
+            score = float(api_response.choices[0].message.content.strip())
             
             # Update the effectiveness score in the database
             conn = sqlite3.connect(self.db_path)
@@ -549,34 +614,118 @@ class SimpleInputGUI:
     def run(self):
         self.root.mainloop()
 
+def get_available_databases():
+    """Get list of existing database files"""
+    return [f for f in os.listdir() if f.endswith('.db')]
+
 def initialize_agent():
     os.system('cls' if os.name == 'nt' else 'clear')
     console.print(Panel.fit(
         "[bold blue]Welcome to LLM Life Agent[/bold blue]\n[italic]A self-reflective AI companion[/italic]",
         border_style="bold blue")
     )
+    
     console.print("\nPlease enter your OpenAI API key:", style="bold")
     api_key = input().strip()
+    
     try:
         client = OpenAI(api_key=api_key)
         client.models.list()
         console.print("\n[green]✓ API key validated successfully![/green]")
-        return client
-    except Exception:
-        console.print("\n[red]✗ Invalid API key. Please check and try again.[/red]")
+        
+        # Check for existing databases
+        existing_dbs = get_available_databases()
+        
+        if existing_dbs:
+            console.print("\n[bold cyan]Found existing agent databases:[/bold cyan]")
+            for i, db in enumerate(existing_dbs, 1):
+                console.print(f"{i}. {db}")
+            console.print("n. Create new agent")
+            
+            choice = Prompt.ask(
+                "Choose an option",
+                choices=[str(i) for i in range(1, len(existing_dbs) + 1)] + ['n'],
+                default="n"
+            )
+            
+            if choice == 'n':
+                # Create new agent with new database
+                db_name = Prompt.ask("\nEnter name for new agent database", default="new_agent.db")
+                if not db_name.endswith('.db'):
+                    db_name += '.db'
+                agent = ThinkingAgent(client, db_path=db_name)
+                
+                # Configure new agent
+                console.print("\n[bold cyan]Let's configure your new AI agent![/bold cyan]")
+                configure_new_agent(agent)
+            else:
+                # Load existing agent
+                db_path = existing_dbs[int(choice) - 1]
+                agent = ThinkingAgent(client, db_path=db_path)
+                
+                if agent.load_active_identity():
+                    console.print("\n[green]✓ Loaded existing agent configuration![/green]")
+                else:
+                    console.print("\n[yellow]No active configuration found. Let's create one![/yellow]")
+                    configure_new_agent(agent)
+        else:
+            # No existing databases, create new
+            console.print("\n[cyan]Creating new agent...[/cyan]")
+            agent = ThinkingAgent(client)
+            configure_new_agent(agent)
+        
+        return agent
+        
+    except Exception as e:
+        console.print(f"\n[red]✗ Error: {str(e)}[/red]")
         return None
+
+def configure_new_agent(agent):
+    """Configure a new agent's identity"""
+    console.print("\nWhat is the primary purpose of this agent? (e.g., 'Help me learn Spanish', 'Assist with creative writing')", style="bold")
+    purpose = input().strip()
+    
+    console.print("\nDescribe the agent's personality (or press Enter for default):", style="cyan")
+    console.print("Example: 'Patient and encouraging' or 'Analytical and direct'", style="dim")
+    personality = input().strip()
+    
+    console.print("\nSpecify any particular goals (or press Enter for default):", style="cyan")
+    console.print("Example: 'Focus on practical conversation skills' or 'Emphasize creative storytelling'", style="dim")
+    goals = input().strip()
+    
+    console.print("\nAny constraints or specific guidelines? (or press Enter for default):", style="cyan")
+    console.print("Example: 'Keep responses concise' or 'Always include examples'", style="dim")
+    constraints = input().strip()
+    
+    # Store the configuration
+    conn = sqlite3.connect(agent.db_path)
+    cursor = conn.cursor()
+    
+    # Deactivate any existing configurations
+    cursor.execute("UPDATE agent_identity SET is_active = 0 WHERE is_active = 1")
+    
+    # Insert new configuration
+    cursor.execute("""
+    INSERT INTO agent_identity (purpose, personality, goals, constraints)
+    VALUES (?, ?, ?, ?)
+    """, (purpose, personality, goals, constraints))
+    
+    conn.commit()
+    conn.close()
+    
+    # Load the new configuration
+    agent.load_active_identity()
+    console.print("\n[green]✓ Agent configured successfully![/green]")
 
 def main():
     while True:
-        client = initialize_agent()
-        if client:
+        agent = initialize_agent()  # This creates the ThinkingAgent
+        if agent:
             break
         if Prompt.ask("\nWould you like to try again?", choices=["y", "n"], default="y") != "y":
             console.print("\n[yellow]Goodbye![/yellow]")
             return
 
-    agent = ThinkingAgent(client)
-    
     # Create and run the GUI
     gui = SimpleInputGUI(agent)
     try:

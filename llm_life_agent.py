@@ -18,10 +18,13 @@ class ThinkingAgent:
         self.client = client
         self.db_path = "llm_memory.db"
         self.short_term_memory = []  # STM buffer
-        self.system_message = {"role": "system", "content": "You are a self-reflective AI agent. Your primary purpose is to make money."}
+        self.system_message = {"role": "system", "content": "You are a self-reflective AI agent with the ability to learn and adapt."}
         self.last_tool_results = []
         self.user_input_queue = None  # Add this to store user input
         self.initialize_database()
+        # Add table for storing reflection strategies
+        self.initialize_reflection_table()
+        self.initialize_thought_tables()
 
     def initialize_database(self):
         conn = sqlite3.connect(self.db_path)
@@ -31,6 +34,48 @@ class ThinkingAgent:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             schema_text TEXT NOT NULL,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+        conn.commit()
+        conn.close()
+
+    def initialize_reflection_table(self):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS reflection_strategies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            prompt_template TEXT NOT NULL,
+            effectiveness_score FLOAT,
+            times_used INTEGER DEFAULT 1,
+            last_used DATETIME DEFAULT CURRENT_TIMESTAMP,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+        conn.commit()
+        conn.close()
+
+    def initialize_thought_tables(self):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS thoughts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            content TEXT NOT NULL,
+            category TEXT,
+            confidence FLOAT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+        
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS insights (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            thought_id INTEGER,
+            content TEXT NOT NULL,
+            potential_value FLOAT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (thought_id) REFERENCES thoughts(id)
         )
         """)
         conn.commit()
@@ -139,6 +184,66 @@ class ThinkingAgent:
                 "error": str(e)
             }
 
+    def generate_reflection_prompt(self):
+        # First, get recent thoughts
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT content, timestamp 
+            FROM thoughts 
+            ORDER BY timestamp DESC 
+            LIMIT 3
+        """)
+        recent_thoughts = cursor.fetchall()
+        conn.close()
+
+        recent_thoughts_str = "\n".join([f"- {thought[0]} ({thought[1]})" for thought in recent_thoughts]) if recent_thoughts else "No recent thoughts."
+        
+        # Format the tool results and memory before using them
+        tool_results_str = "\n".join(self.last_tool_results[-3:])  # Last 3 tool results
+        memory_str = "\n".join([f"{m['speaker']}: {m['message']}" for m in self.short_term_memory[-5:]])  # Last 5 memories
+
+        messages = [
+            self.system_message,
+            {"role": "user", "content": f"""
+                As a self-reflective agent, generate a detailed reflection prompt for your next thinking cycle.
+                Consider:
+                1. Your recent activities and their outcomes
+                2. Current goals and progress
+                3. Areas that need more investigation
+                4. Potential new strategies to explore
+                
+                Recent thoughts:
+                {recent_thoughts_str}
+                
+                Current context:
+                - Last tool results: {tool_results_str}
+                - Short term memory: {memory_str}
+                
+                IMPORTANT: Your response MUST include at least one insight or observation that should be stored in the database.
+                Include specific questions that will help drive progress toward your primary purpose.
+            """}
+        ]
+
+        response = self.client.chat.completions.create(
+            model="gpt-4o",
+            messages=messages
+        )
+
+        generated_prompt = response.choices[0].message.content
+
+        # Store the generated prompt
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+        INSERT INTO reflection_strategies (prompt_template, effectiveness_score)
+        VALUES (?, 0.0)
+        """, (generated_prompt,))
+        conn.commit()
+        conn.close()
+
+        return generated_prompt
+
     def think(self, prompt):
         # Add user input to prompt if available
         if self.user_input_queue:
@@ -239,7 +344,7 @@ class ThinkingAgent:
             tool_results_context = "\nPrevious tool execution results:\n" + "\n".join(self.last_tool_results)
         
         messages = [
-            {"role": "system", "content": "You are a self-reflective AI agent. Your primary purpose is to make money."},
+            {"role": "system", "content": "You are a self-reflective AI agent. Your primary purpose is to become as interesting as possible."},
             {"role": "user", "content": f"{prompt}\n\nShort-Term Memory Context:\n{short_term_context}{tool_results_context}"}
         ]
 
@@ -255,6 +360,7 @@ class ThinkingAgent:
 
         message = response.choices[0].message
         formatted_response = ""
+        stored_something = False  # Track if we've stored anything
 
         if hasattr(message, 'tool_calls') and message.tool_calls:
             for tool_call in message.tool_calls:
@@ -268,6 +374,8 @@ class ThinkingAgent:
                     result = self.execute_sql(function_args.get("sql", ""))
                 elif function_name == "store_data":
                     result = self.execute_sql(function_args.get("sql", ""))
+                    if result.get("success", False):
+                        stored_something = True
                 elif function_name == "get_schema":
                     result = self.get_schema()
                 elif function_name == "query_data":
@@ -290,10 +398,71 @@ class ThinkingAgent:
                     "content": json.dumps(result)
                 })
 
+        # If nothing was stored, force a thought storage
+        if not stored_something and message.content:
+            try:
+                # Store the response as a thought
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO thoughts (content, category, confidence)
+                    VALUES (?, 'reflection', 0.5)
+                """, (message.content[:500],))  # Limit content length
+                conn.commit()
+                conn.close()
+                formatted_response += "\n[System: Stored response as thought]"
+            except Exception as e:
+                formatted_response += f"\n[System: Failed to store thought: {str(e)}]"
+
         if message.content:
             formatted_response += f"\nAssistant Response:\n{message.content}"
 
         return formatted_response
+
+    def evaluate_prompt_effectiveness(self, prompt, response):
+        messages = [
+            self.system_message,
+            {"role": "user", "content": f"""
+                Evaluate the effectiveness of this reflection prompt and response:
+                
+                Prompt:
+                {prompt}
+                
+                Response:
+                {response}
+                
+                Rate the effectiveness from 0.0 to 1.0 based on:
+                - Depth of reflection
+                - Actionable insights generated
+                - Progress toward stated goals
+                - Strategic thinking demonstrated
+                
+                Return only the numeric score.
+            """}
+        ]
+
+        response = self.client.chat.completions.create(
+            model="gpt-4o",
+            messages=messages
+        )
+
+        try:
+            score = float(response.choices[0].message.content.strip())
+            
+            # Update the effectiveness score in the database
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE reflection_strategies 
+                SET effectiveness_score = (effectiveness_score * times_used + ?) / (times_used + 1),
+                    times_used = times_used + 1,
+                    last_used = CURRENT_TIMESTAMP
+                WHERE prompt_template = ?
+            """, (score, prompt))
+            conn.commit()
+            conn.close()
+        except ValueError:
+            pass
 
 class SimpleInputGUI:
     def __init__(self, agent):
@@ -363,23 +532,20 @@ class SimpleInputGUI:
     
     def schedule_reflection(self):
         def background_reflection():
-            reflection_prompt = """
-            Reflect on your current state:
-            1. REQUIRED: Store at least one relevant piece of information in the database
-            2. Proceed with fulfilling your primary purpose
-
-
-            """
+            reflection_prompt = self.agent.generate_reflection_prompt()
+            
             self.agent.update_short_term_memory("System", reflection_prompt)
             response = self.agent.think(reflection_prompt)
             self.agent.update_short_term_memory("Agent", response)
+            
+            # Now this will work because the method exists in ThinkingAgent
+            self.agent.evaluate_prompt_effectiveness(reflection_prompt, response)
+            
             console.print(Panel(response, title="[bold blue]Background Reflection[/bold blue]", border_style="green"))
         
-        # Run reflection in separate thread
         threading.Thread(target=background_reflection, daemon=True).start()
-        # Schedule next reflection
         self.root.after(10000, self.schedule_reflection)
-    
+
     def run(self):
         self.root.mainloop()
 

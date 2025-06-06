@@ -234,6 +234,34 @@ class ThinkingAgent:
                 "error": str(e)
             }
 
+    def semantic_search(self, question: str):
+        """Convert a natural language question to SQL and execute it."""
+        schema_text = self.get_latest_schema_text()
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are an assistant that helps translate natural language"
+                    " questions into SQL SELECT statements based on the provided"
+                    " schema. Return only the SQL query.\nSchema:\n"
+                    f"{schema_text}"
+                ),
+            },
+            {"role": "user", "content": question},
+        ]
+
+        response = self.make_openai_call(messages)
+        if not response:
+            return {"success": False, "error": "OpenAI call failed"}
+
+        sql = response.choices[0].message.content.strip()
+        if sql.startswith("```"):
+            sql = sql.strip("`\n")
+            if sql.lower().startswith("sql"):
+                sql = sql[3:].lstrip()
+
+        return self.query_database(sql)
+
     def make_openai_call(self, messages, tools=None):
         """Helper method to standardize OpenAI API calls"""
         try:
@@ -401,6 +429,23 @@ class ThinkingAgent:
                         "required": ["query"]
                     }
                 }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "semantic_search",
+                    "description": "Answer questions about stored information using natural language",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "question": {
+                                "type": "string",
+                                "description": "The question to transform into an SQL SELECT statement"
+                            }
+                        },
+                        "required": ["question"]
+                    }
+                }
             }
         ]
 
@@ -448,6 +493,8 @@ class ThinkingAgent:
                     result = self.query_database(function_args.get("sql", ""))
                 elif function_name == "web_search":
                     result = self.perform_web_search(function_args.get("query", ""))
+                elif function_name == "semantic_search":
+                    result = self.semantic_search(function_args.get("question", ""))
                 else:
                     result = {"error": "Unknown function"}
 

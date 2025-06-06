@@ -12,6 +12,7 @@ It’s designed to be a complete thinking agent with journaling, reflection prom
 - Reflection prompt scoring and strategy evaluation
 - Web search integration using OpenAI `responses` API
 - Simple Tkinter-based GUI interface
+- Semantic search over stored data (e.g., "What thoughts did I record today?")
 
 ## Start
 

@@ -56,5 +56,20 @@ class ThinkingAgentTests(unittest.TestCase):
         self.mock_client.chat.completions.create.assert_called_once()
         self.assertEqual(response.choices[0].message.content, 'Test response')
 
+    def test_semantic_search(self):
+        # Insert sample thoughts
+        self.agent.execute_sql("INSERT INTO thoughts (content) VALUES ('Thought1')")
+        self.agent.execute_sql("INSERT INTO thoughts (content) VALUES ('Thought2')")
+
+        # Mock OpenAI to return SQL for the semantic search
+        fake_response = MagicMock()
+        fake_choice = MagicMock()
+        fake_choice.message.content = "SELECT content FROM thoughts"
+        fake_response.choices = [fake_choice]
+        self.mock_client.chat.completions.create.return_value = fake_response
+
+        result = self.agent.semantic_search("List all stored thoughts")
+        self.assertEqual(result['rows'], [('Thought1',), ('Thought2',)])
+
 if __name__ == '__main__':
     unittest.main()

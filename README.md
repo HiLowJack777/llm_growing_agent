@@ -21,3 +21,10 @@ It’s designed to be a complete thinking agent with journaling, reflection prom
    cd llm_growing_agent
 2. Input your OpenAI API Key.
 3. Create your first agent.
+
+## Testing
+
+Run the unit tests with:
+```bash
+python -m unittest
+```

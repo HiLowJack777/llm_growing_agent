@@ -4,6 +4,7 @@ import sqlite3
 from datetime import datetime
 import os
 import json
+import re
 import time
 from rich.console import Console
 from rich.panel import Panel
@@ -21,6 +22,8 @@ class ThinkingAgent:
         self.system_message = {"role": "system", "content": "You are a self-reflective AI agent with the ability to learn and adapt."}
         self.last_tool_results = []
         self.user_input_queue = None  # Add this to store user input
+        self.current_strategy_id = None  # reflection_strategies row for the active prompt
+        self.max_tool_rounds = 5  # max tool-call rounds within a single think() turn
         self.initialize_database()
         # Add table for storing reflection strategies
         self.initialize_reflection_table()
@@ -254,6 +257,34 @@ class ThinkingAgent:
             console.print(f"[red]Error in OpenAI API call: {str(e)}[/red]")
             return None
 
+    def get_scored_strategies(self, best=3, worst=2):
+        """Return (best, worst) previously evaluated reflection prompts with their scores."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            base = """
+                SELECT prompt_template, effectiveness_score, times_used
+                FROM reflection_strategies
+                WHERE effectiveness_score IS NOT NULL AND times_used > 0
+            """
+            cursor.execute(base + " ORDER BY effectiveness_score DESC, times_used DESC LIMIT ?", (best,))
+            top = cursor.fetchall()
+            cursor.execute(base + " ORDER BY effectiveness_score ASC, times_used DESC LIMIT ?", (worst,))
+            bottom = [row for row in cursor.fetchall() if row not in top]
+            return top, bottom
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _format_strategies(rows, max_chars=600):
+        if not rows:
+            return "None yet."
+        lines = []
+        for prompt, score, uses in rows:
+            text = prompt if len(prompt) <= max_chars else prompt[:max_chars] + "..."
+            lines.append(f"[score {score:.2f}, used {uses}x]\n{text}")
+        return "\n\n".join(lines)
+
     def generate_reflection_prompt(self):
         # First, get recent thoughts
         conn = sqlite3.connect(self.db_path)
@@ -273,6 +304,9 @@ class ThinkingAgent:
         tool_results_str = "\n".join(self.last_tool_results[-3:])  # Last 3 tool results
         memory_str = "\n".join([f"{m['speaker']}: {m['message']}" for m in self.short_term_memory[-5:]])  # Last 5 memories
 
+        # Learn from past evaluations: show what scored well and what scored poorly
+        top_strategies, bottom_strategies = self.get_scored_strategies()
+
         messages = [
             self.system_message,
             {"role": "user", "content": f"""
@@ -290,6 +324,12 @@ class ThinkingAgent:
                 - Last tool results: {tool_results_str}
                 - Short term memory: {memory_str}
                 
+                Your highest-scoring past reflection prompts (build on what made these effective):
+                {self._format_strategies(top_strategies)}
+                
+                Your lowest-scoring past reflection prompts (avoid what made these weak):
+                {self._format_strategies(bottom_strategies)}
+                
                 IMPORTANT: Your response MUST include at least one insight or observation that should be stored in the database.
                 Include specific questions that will help drive progress toward your primary purpose.
             """}
@@ -297,17 +337,19 @@ class ThinkingAgent:
 
         response = self.make_openai_call(messages)
         if not response:
+            self.current_strategy_id = None
             return "Failed to generate reflection prompt"
         
         generated_prompt = response.choices[0].message.content
 
-        # Store the generated prompt
+        # Store the generated prompt (unscored and unused until evaluated)
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute("""
-        INSERT INTO reflection_strategies (prompt_template, effectiveness_score)
-        VALUES (?, 0.0)
+        INSERT INTO reflection_strategies (prompt_template, effectiveness_score, times_used)
+        VALUES (?, NULL, 0)
         """, (generated_prompt,))
+        self.current_strategy_id = cursor.lastrowid
         conn.commit()
         conn.close()
 
@@ -404,7 +446,6 @@ class ThinkingAgent:
             }
         ]
 
-        schema_text = self.get_latest_schema_text()
         short_term_context = "\n".join([f"{entry['speaker']}: {entry['message']}" for entry in self.short_term_memory])
         
         # Include any previous tool results in the context
@@ -413,59 +454,56 @@ class ThinkingAgent:
             tool_results_context = "\nPrevious tool execution results:\n" + "\n".join(self.last_tool_results)
         
         messages = [
-            {"role": "system", "content": "You are a self-reflective AI agent. Your primary purpose is to become as interesting as possible."},
+            self.system_message,
             {"role": "user", "content": f"{prompt}\n\nShort-Term Memory Context:\n{short_term_context}{tool_results_context}"}
         ]
 
         # Reset tool results for this iteration
         self.last_tool_results = []
 
-        response = self.make_openai_call(messages, tools=tools)
-        if not response:
-            return "Failed to process thought"
-        
-        message = response.choices[0].message
         formatted_response = ""
         stored_something = False  # Track if we've stored anything
+        message = None
 
-        if hasattr(message, 'tool_calls') and message.tool_calls:
-            for tool_call in message.tool_calls:
+        # Let the model call tools, see the results, and continue in the same turn.
+        for round_number in range(self.max_tool_rounds + 1):
+            # On the last allowed round, withhold tools so the model must answer.
+            round_tools = tools if round_number < self.max_tool_rounds else None
+            response = self.make_openai_call(messages, tools=round_tools)
+            if not response:
+                if message is None:
+                    return "Failed to process thought"
+                break
+
+            message = response.choices[0].message
+            tool_calls = getattr(message, 'tool_calls', None) or []
+            if not tool_calls:
+                break
+
+            # The assistant message containing the tool calls goes in once,
+            # followed by one tool message per call.
+            messages.append(message.model_dump(exclude_none=True))
+            for tool_call in tool_calls:
                 function_name = tool_call.function.name
-                try:
-                    function_args = json.loads(tool_call.function.arguments)
-                except Exception:
-                    function_args = {}
+                result = self.execute_tool(function_name, tool_call.function.arguments)
+                if function_name == "store_data" and result.get("success", False):
+                    stored_something = True
 
-                if function_name == "execute_migration":
-                    result = self.execute_sql(function_args.get("sql", ""))
-                elif function_name == "store_data":
-                    result = self.execute_sql(function_args.get("sql", ""))
-                    if result.get("success", False):
-                        stored_something = True
-                elif function_name == "get_schema":
-                    result = self.get_schema()
-                elif function_name == "query_data":
-                    result = self.query_database(function_args.get("sql", ""))
-                elif function_name == "web_search":
-                    result = self.perform_web_search(function_args.get("query", ""))
-                else:
-                    result = {"error": "Unknown function"}
-
-                # Store the result for next iteration
-                result_str = f"Tool {function_name}: {json.dumps(result, indent=2)}"
+                # Keep the result for the next cycle's context, too
+                result_str = f"Tool {function_name}: {json.dumps(result, indent=2, default=str)}"
                 self.last_tool_results.append(result_str)
-                formatted_response += f"\nTool Execution Result ({function_name}):\n{json.dumps(result, indent=2)}"
+                formatted_response += f"\nTool Execution Result ({function_name}):\n{json.dumps(result, indent=2, default=str)}"
 
-                messages.append(message.model_dump())
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call.id,
-                    "name": function_name,
-                    "content": json.dumps(result)
+                    "content": json.dumps(result, default=str)
                 })
 
+        content = getattr(message, 'content', None) if message is not None else None
+
         # If nothing was stored, force a thought storage
-        if not stored_something and message.content:
+        if not stored_something and content:
             try:
                 # Store the response as a thought
                 conn = sqlite3.connect(self.db_path)
@@ -473,19 +511,36 @@ class ThinkingAgent:
                 cursor.execute("""
                     INSERT INTO thoughts (content, category, confidence)
                     VALUES (?, 'reflection', 0.5)
-                """, (message.content[:500],))  # Limit content length
+                """, (content[:500],))  # Limit content length
                 conn.commit()
                 conn.close()
                 formatted_response += "\n[System: Stored response as thought]"
             except Exception as e:
                 formatted_response += f"\n[System: Failed to store thought: {str(e)}]"
 
-        if message.content:
-            formatted_response += f"\nAssistant Response:\n{message.content}"
+        if content:
+            formatted_response += f"\nAssistant Response:\n{content}"
 
         return formatted_response
 
-    def evaluate_prompt_effectiveness(self, prompt, response):
+    def execute_tool(self, function_name, raw_arguments):
+        """Run one tool call from the model and return its result dict."""
+        try:
+            function_args = json.loads(raw_arguments) if raw_arguments else {}
+        except Exception:
+            function_args = {}
+
+        if function_name in ("execute_migration", "store_data"):
+            return self.execute_sql(function_args.get("sql", ""))
+        if function_name == "get_schema":
+            return self.get_schema()
+        if function_name == "query_data":
+            return self.query_database(function_args.get("sql", ""))
+        if function_name == "web_search":
+            return self.perform_web_search(function_args.get("query", ""))
+        return {"error": f"Unknown function: {function_name}"}
+
+    def evaluate_prompt_effectiveness(self, prompt, response, strategy_id=None):
         messages = [
             self.system_message,
             {"role": "user", "content": f"""
@@ -509,25 +564,41 @@ class ThinkingAgent:
 
         api_response = self.make_openai_call(messages)
         if not api_response:
-            return
-        
-        try:
-            score = float(api_response.choices[0].message.content.strip())
-            
-            # Update the effectiveness score in the database
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            cursor.execute("""
-                UPDATE reflection_strategies 
-                SET effectiveness_score = (effectiveness_score * times_used + ?) / (times_used + 1),
-                    times_used = times_used + 1,
-                    last_used = CURRENT_TIMESTAMP
-                WHERE prompt_template = ?
-            """, (score, prompt))
-            conn.commit()
-            conn.close()
-        except ValueError:
-            pass
+            return None
+
+        score = self.parse_score(api_response.choices[0].message.content)
+        if score is None:
+            return None
+
+        # Fold the score into the strategy's running average. A fresh row has
+        # times_used = 0 and a NULL score, so the first evaluation sets it outright.
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        update = """
+            UPDATE reflection_strategies
+            SET effectiveness_score = (COALESCE(effectiveness_score, 0) * times_used + ?) / (times_used + 1),
+                times_used = times_used + 1,
+                last_used = CURRENT_TIMESTAMP
+        """
+        if strategy_id is None:
+            strategy_id = self.current_strategy_id
+        if strategy_id is not None:
+            cursor.execute(update + " WHERE id = ?", (score, strategy_id))
+        else:
+            cursor.execute(update + " WHERE id = (SELECT MAX(id) FROM reflection_strategies WHERE prompt_template = ?)", (score, prompt))
+        conn.commit()
+        conn.close()
+        return score
+
+    @staticmethod
+    def parse_score(text):
+        """Pull a 0.0-1.0 score out of the model's reply, e.g. '0.8', 'Score: 0.75.'"""
+        if not text:
+            return None
+        match = re.search(r"\d+(?:\.\d+)?", text)
+        if not match:
+            return None
+        return max(0.0, min(1.0, float(match.group())))
 
 class SimpleInputGUI:
     def __init__(self, agent):
@@ -598,13 +669,14 @@ class SimpleInputGUI:
     def schedule_reflection(self):
         def background_reflection():
             reflection_prompt = self.agent.generate_reflection_prompt()
+            strategy_id = self.agent.current_strategy_id
             
             self.agent.update_short_term_memory("System", reflection_prompt)
             response = self.agent.think(reflection_prompt)
             self.agent.update_short_term_memory("Agent", response)
             
             # Now this will work because the method exists in ThinkingAgent
-            self.agent.evaluate_prompt_effectiveness(reflection_prompt, response)
+            self.agent.evaluate_prompt_effectiveness(reflection_prompt, response, strategy_id)
             
             console.print(Panel(response, title="[bold blue]Background Reflection[/bold blue]", border_style="green"))
         

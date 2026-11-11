@@ -1,5 +1,3 @@
-import openai
-from openai import OpenAI
 import sqlite3
 from datetime import datetime
 import os
@@ -11,12 +9,80 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 import tkinter as tk
 import threading
+from getpass import getpass
+
+from providers import PROVIDERS, ProviderError, create_provider
 
 console = Console()
 
+# Tools the agent can call, described once for every provider.
+TOOLS = [
+    {
+        "name": "execute_migration",
+        "description": "Execute a SQL migration to modify the database schema",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "sql": {"type": "string", "description": "SQL migration command"}
+            },
+            "required": ["sql"],
+        },
+    },
+    {
+        "name": "store_data",
+        "description": "Store any type of data in the database. Use this to record any structured data in your tables.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "sql": {
+                    "type": "string",
+                    "description": "SQL INSERT command for any table. Examples:\n"
+                                   "- INSERT INTO opportunities (name, potential_value) VALUES ('New Market', 50000)\n"
+                                   "- INSERT INTO metrics (category, value) VALUES ('ROI', 12.5)\n"
+                                   "- INSERT INTO thoughts (content) VALUES ('Strategic insight about...')",
+                }
+            },
+            "required": ["sql"],
+        },
+    },
+    {
+        "name": "get_schema",
+        "description": "Get the current database schema",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "query_data",
+        "description": "Query any data from the database tables using SELECT statements",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "sql": {
+                    "type": "string",
+                    "description": "SQL SELECT query. Examples:\n"
+                                   "- SELECT * FROM thoughts ORDER BY timestamp DESC LIMIT 5\n"
+                                   "- SELECT category, COUNT(*) FROM metrics GROUP BY category\n"
+                                   "- SELECT * FROM opportunities WHERE potential_value > 1000",
+                }
+            },
+            "required": ["sql"],
+        },
+    },
+    {
+        "name": "web_search",
+        "description": "Search the internet for current information about markets, opportunities, and trends",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "The search query to look up information online"}
+            },
+            "required": ["query"],
+        },
+    },
+]
+
 class ThinkingAgent:
-    def __init__(self, client, db_path="llm_memory.db"):
-        self.client = client
+    def __init__(self, provider, db_path="llm_memory.db"):
+        self.provider = provider  # an LLMProvider (Claude, OpenAI or Gemini)
         self.db_path = db_path
         self.short_term_memory = []  # STM buffer
         self.system_message = {"role": "system", "content": "You are a self-reflective AI agent with the ability to learn and adapt."}
@@ -29,6 +95,7 @@ class ThinkingAgent:
         self.initialize_reflection_table()
         self.initialize_thought_tables()
         self.initialize_agent_identity()
+        self.initialize_settings_table()
         # Load existing identity if available
         self.load_active_identity()
 
@@ -101,6 +168,35 @@ class ThinkingAgent:
             is_active BOOLEAN DEFAULT 1
         )
         """)
+        conn.commit()
+        conn.close()
+
+    def initialize_settings_table(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS agent_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """)
+        conn.commit()
+        conn.close()
+
+    def get_setting(self, key, default=None):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            row = conn.execute("SELECT value FROM agent_settings WHERE key = ?", (key,)).fetchone()
+            return row[0] if row else default
+        finally:
+            conn.close()
+
+    def set_setting(self, key, value):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "INSERT INTO agent_settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
         conn.commit()
         conn.close()
 
@@ -218,43 +314,15 @@ class ThinkingAgent:
             conn.close()
 
     def perform_web_search(self, query):
-        client = OpenAI()
-        try:
-            response = client.responses.create(
-                model="gpt-4o",
-                input=query,
-                tools=[
-                    {"type": "web_search_preview"}
-                ]
-            )
-            return {
-                "success": True,
-                "results": response.output_text
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e)
-            }
+        return self.provider.web_search(query)
 
-    def make_openai_call(self, messages, tools=None):
-        """Helper method to standardize OpenAI API calls"""
+    def complete(self, prompt, light=False):
+        """Single model call with the agent's identity as the system prompt.
+        light=True uses the provider's cheaper model. Returns None on failure."""
         try:
-            if tools:
-                response = self.client.chat.completions.create(
-                    model="gpt-4o",
-                    messages=messages,
-                    tools=tools,
-                    tool_choice="auto"
-                )
-            else:
-                response = self.client.chat.completions.create(
-                    model="gpt-4o",
-                    messages=messages
-                )
-            return response
-        except Exception as e:
-            console.print(f"[red]Error in OpenAI API call: {str(e)}[/red]")
+            return self.provider.complete(self.system_message["content"], prompt, light=light)
+        except ProviderError as e:
+            console.print(f"[red]Error calling {self.provider.display_name}: {e}[/red]")
             return None
 
     def get_scored_strategies(self, best=3, worst=2):
@@ -307,9 +375,7 @@ class ThinkingAgent:
         # Learn from past evaluations: show what scored well and what scored poorly
         top_strategies, bottom_strategies = self.get_scored_strategies()
 
-        messages = [
-            self.system_message,
-            {"role": "user", "content": f"""
+        request = f"""
                 As a self-reflective agent, generate a detailed reflection prompt for your next thinking cycle.
                 Consider:
                 1. Your recent activities and their outcomes
@@ -332,15 +398,12 @@ class ThinkingAgent:
                 
                 IMPORTANT: Your response MUST include at least one insight or observation that should be stored in the database.
                 Include specific questions that will help drive progress toward your primary purpose.
-            """}
-        ]
+            """
 
-        response = self.make_openai_call(messages)
-        if not response:
+        generated_prompt = self.complete(request)
+        if not generated_prompt:
             self.current_strategy_id = None
             return "Failed to generate reflection prompt"
-        
-        generated_prompt = response.choices[0].message.content
 
         # Store the generated prompt (unscored and unused until evaluated)
         conn = sqlite3.connect(self.db_path)
@@ -360,152 +423,49 @@ class ThinkingAgent:
         if self.user_input_queue:
             prompt = f"{prompt}\n\nUser Input: {self.user_input_queue}"
             self.user_input_queue = None  # Clear the queue after using it
-            
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "execute_migration",
-                    "description": "Execute a SQL migration to modify the database schema",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "sql": {"type": "string", "description": "SQL migration command"}
-                        },
-                        "required": ["sql"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "store_data",
-                    "description": "Store any type of data in the database. Use this to record any structured data in your tables.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "sql": {
-                                "type": "string", 
-                                "description": "SQL INSERT command for any table. Examples:\n" +
-                                             "- INSERT INTO opportunities (name, potential_value) VALUES ('New Market', 50000)\n" +
-                                             "- INSERT INTO metrics (category, value) VALUES ('ROI', 12.5)\n" +
-                                             "- INSERT INTO thoughts (content) VALUES ('Strategic insight about...')"
-                            }
-                        },
-                        "required": ["sql"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_schema",
-                    "description": "Get the current database schema",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {}
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "query_data",
-                    "description": "Query any data from the database tables using SELECT statements",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "sql": {
-                                "type": "string", 
-                                "description": "SQL SELECT query. Examples:\n" +
-                                             "- SELECT * FROM thoughts ORDER BY timestamp DESC LIMIT 5\n" +
-                                             "- SELECT category, COUNT(*) FROM metrics GROUP BY category\n" +
-                                             "- SELECT * FROM opportunities WHERE potential_value > 1000"
-                            }
-                        },
-                        "required": ["sql"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "web_search",
-                    "description": "Search the internet for current information about markets, opportunities, and trends",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "query": {
-                                "type": "string",
-                                "description": "The search query to look up information online"
-                            }
-                        },
-                        "required": ["query"]
-                    }
-                }
-            }
-        ]
 
         short_term_context = "\n".join([f"{entry['speaker']}: {entry['message']}" for entry in self.short_term_memory])
-        
+
         # Include any previous tool results in the context
         tool_results_context = ""
         if self.last_tool_results:
             tool_results_context = "\nPrevious tool execution results:\n" + "\n".join(self.last_tool_results)
-        
-        messages = [
-            self.system_message,
-            {"role": "user", "content": f"{prompt}\n\nShort-Term Memory Context:\n{short_term_context}{tool_results_context}"}
-        ]
+
+        user_content = f"{prompt}\n\nShort-Term Memory Context:\n{short_term_context}{tool_results_context}"
 
         # Reset tool results for this iteration
         self.last_tool_results = []
+        log = []
+        stored = {"any": False}
 
-        formatted_response = ""
-        stored_something = False  # Track if we've stored anything
-        message = None
+        def handle_tool(name, args):
+            result = self.execute_tool(name, args)
+            if name == "store_data" and result.get("success", False):
+                stored["any"] = True
+            # Keep the result for the next cycle's context, too
+            pretty = json.dumps(result, indent=2, default=str)
+            self.last_tool_results.append(f"Tool {name}: {pretty}")
+            log.append(f"\nTool Execution Result ({name}):\n{pretty}")
+            return result
 
-        # Let the model call tools, see the results, and continue in the same turn.
-        for round_number in range(self.max_tool_rounds + 1):
-            # On the last allowed round, withhold tools so the model must answer.
-            round_tools = tools if round_number < self.max_tool_rounds else None
-            response = self.make_openai_call(messages, tools=round_tools)
-            if not response:
-                if message is None:
-                    return "Failed to process thought"
-                break
+        # The provider runs the tool loop: the model calls tools, sees the
+        # results, and continues within this same turn.
+        try:
+            content = self.provider.run_with_tools(
+                self.system_message["content"], user_content, TOOLS, handle_tool,
+                max_rounds=self.max_tool_rounds,
+            )
+        except ProviderError as e:
+            console.print(f"[red]Error calling {self.provider.display_name}: {e}[/red]")
+            if not log:
+                return "Failed to process thought"
+            content = None
 
-            message = response.choices[0].message
-            tool_calls = getattr(message, 'tool_calls', None) or []
-            if not tool_calls:
-                break
-
-            # The assistant message containing the tool calls goes in once,
-            # followed by one tool message per call.
-            messages.append(message.model_dump(exclude_none=True))
-            for tool_call in tool_calls:
-                function_name = tool_call.function.name
-                result = self.execute_tool(function_name, tool_call.function.arguments)
-                if function_name == "store_data" and result.get("success", False):
-                    stored_something = True
-
-                # Keep the result for the next cycle's context, too
-                result_str = f"Tool {function_name}: {json.dumps(result, indent=2, default=str)}"
-                self.last_tool_results.append(result_str)
-                formatted_response += f"\nTool Execution Result ({function_name}):\n{json.dumps(result, indent=2, default=str)}"
-
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": json.dumps(result, default=str)
-                })
-
-        content = getattr(message, 'content', None) if message is not None else None
+        formatted_response = "".join(log)
 
         # If nothing was stored, force a thought storage
-        if not stored_something and content:
+        if not stored["any"] and content:
             try:
-                # Store the response as a thought
                 conn = sqlite3.connect(self.db_path)
                 cursor = conn.cursor()
                 cursor.execute("""
@@ -523,12 +483,14 @@ class ThinkingAgent:
 
         return formatted_response
 
-    def execute_tool(self, function_name, raw_arguments):
+    def execute_tool(self, function_name, function_args):
         """Run one tool call from the model and return its result dict."""
-        try:
-            function_args = json.loads(raw_arguments) if raw_arguments else {}
-        except Exception:
-            function_args = {}
+        if isinstance(function_args, str):
+            try:
+                function_args = json.loads(function_args) if function_args else {}
+            except Exception:
+                function_args = {}
+        function_args = function_args or {}
 
         if function_name in ("execute_migration", "store_data"):
             return self.execute_sql(function_args.get("sql", ""))
@@ -541,9 +503,7 @@ class ThinkingAgent:
         return {"error": f"Unknown function: {function_name}"}
 
     def evaluate_prompt_effectiveness(self, prompt, response, strategy_id=None):
-        messages = [
-            self.system_message,
-            {"role": "user", "content": f"""
+        request = f"""
                 Evaluate the effectiveness of this reflection prompt and response:
                 
                 Prompt:
@@ -559,14 +519,10 @@ class ThinkingAgent:
                 - Strategic thinking demonstrated
                 
                 Return only the numeric score.
-            """}
-        ]
+            """
 
-        api_response = self.make_openai_call(messages)
-        if not api_response:
-            return None
-
-        score = self.parse_score(api_response.choices[0].message.content)
+        # Scoring is a simple task, so it runs on the provider's light model.
+        score = self.parse_score(self.complete(request, light=True))
         if score is None:
             return None
 
@@ -690,64 +646,123 @@ def get_available_databases():
     """Get list of existing database files"""
     return [f for f in os.listdir() if f.endswith('.db')]
 
+def choose_agent_database():
+    """Pick an existing agent database or name a new one. Returns (db_path, is_new)."""
+    existing_dbs = get_available_databases()
+    if existing_dbs:
+        console.print("\n[bold cyan]Found existing agent databases:[/bold cyan]")
+        for i, db in enumerate(existing_dbs, 1):
+            console.print(f"{i}. {db}")
+        console.print("n. Create new agent")
+        choice = Prompt.ask(
+            "Choose an option",
+            choices=[str(i) for i in range(1, len(existing_dbs) + 1)] + ['n'],
+            default="n"
+        )
+        if choice != 'n':
+            return existing_dbs[int(choice) - 1], False
+        db_name = Prompt.ask("\nEnter name for new agent database", default="new_agent.db")
+        if not db_name.endswith('.db'):
+            db_name += '.db'
+        return db_name, True
+    console.print("\n[cyan]Creating new agent...[/cyan]")
+    return "llm_memory.db", True
+
+def choose_provider_name(saved=None):
+    """Ask which engine to use, marking the ones with an API key already set."""
+    names = list(PROVIDERS)
+    console.print("\n[bold cyan]Which engine should this agent think with?[/bold cyan]")
+    for i, name in enumerate(names, 1):
+        cls = PROVIDERS[name]
+        has_key = bool(os.environ.get(cls.env_var)) or (name == "gemini" and os.environ.get("GOOGLE_API_KEY"))
+        note = " [green](API key found)[/green]" if has_key else ""
+        console.print(f"{i}. {cls.display_name}{note}")
+    default = str(names.index(saved) + 1) if saved in names else "1"
+    choice = Prompt.ask("Choose an engine", choices=[str(i) for i in range(1, len(names) + 1)], default=default)
+    return names[int(choice) - 1]
+
+def get_api_key(provider_name):
+    cls = PROVIDERS[provider_name]
+    key = os.environ.get(cls.env_var) or (os.environ.get("GOOGLE_API_KEY") if provider_name == "gemini" else None)
+    if key:
+        console.print(f"[dim]Using API key from ${cls.env_var}.[/dim]")
+        return key
+    return getpass(f"\nEnter your {cls.display_name} API key (input hidden): ").strip()
+
+def choose_model(label, available, preferred=None):
+    """Use the preferred model if the account has it; otherwise pick from the live list."""
+    if preferred and preferred in available:
+        if Prompt.ask(f"Use [bold]{preferred}[/bold] as the {label}?", choices=["y", "n"], default="y") == "y":
+            return preferred
+    elif preferred:
+        console.print(f"[yellow]{preferred} is not available on this account.[/yellow]")
+    console.print(f"\n[bold cyan]Available models for the {label}:[/bold cyan]")
+    for i, model_id in enumerate(available, 1):
+        console.print(f"{i}. {model_id}")
+    choice = Prompt.ask("Choose a model (number or exact ID)")
+    if choice.isdigit() and 1 <= int(choice) <= len(available):
+        return available[int(choice) - 1]
+    return choice.strip()
+
+def setup_provider(agent):
+    """Pick the engine and models for an agent, reusing what it saved last time."""
+    saved_provider = agent.get_setting("provider")
+    saved_model = agent.get_setting("model")
+    saved_light = agent.get_setting("light_model")
+
+    use_saved = False
+    if saved_provider in PROVIDERS and saved_model:
+        console.print(
+            f"\nThis agent last ran on [bold]{PROVIDERS[saved_provider].display_name}[/bold] "
+            f"with [bold]{saved_model}[/bold] (light model: {saved_light or saved_model})."
+        )
+        use_saved = Prompt.ask("Keep that setup?", choices=["y", "n"], default="y") == "y"
+
+    provider_name = saved_provider if use_saved else choose_provider_name(saved_provider)
+    api_key = get_api_key(provider_name)
+    provider = create_provider(provider_name, api_key=api_key)
+
+    if use_saved:
+        provider.model, provider.light_model = saved_model, saved_light or saved_model
+    else:
+        available = provider.list_models()  # also validates the API key
+        console.print("\n[green]✓ API key validated successfully![/green]")
+        cls = PROVIDERS[provider_name]
+        provider.model = choose_model("main thinking model", available, cls.default_model)
+        provider.light_model = choose_model(
+            "light model (scores reflection prompts)", available, cls.default_light_model or provider.model
+        )
+        agent.set_setting("provider", provider_name)
+        agent.set_setting("model", provider.model)
+        agent.set_setting("light_model", provider.light_model)
+
+    agent.provider = provider
+    console.print(f"\n[green]✓ Thinking with {provider.display_name}: {provider.model}[/green]")
+    return provider
+
 def initialize_agent():
     os.system('cls' if os.name == 'nt' else 'clear')
     console.print(Panel.fit(
         "[bold blue]Welcome to LLM Life Agent[/bold blue]\n[italic]A self-reflective AI companion[/italic]",
         border_style="bold blue")
     )
-    
-    console.print("\nPlease enter your OpenAI API key:", style="bold")
-    api_key = input().strip()
-    
+
     try:
-        client = OpenAI(api_key=api_key)
-        client.models.list()
-        console.print("\n[green]✓ API key validated successfully![/green]")
-        
-        # Check for existing databases
-        existing_dbs = get_available_databases()
-        
-        if existing_dbs:
-            console.print("\n[bold cyan]Found existing agent databases:[/bold cyan]")
-            for i, db in enumerate(existing_dbs, 1):
-                console.print(f"{i}. {db}")
-            console.print("n. Create new agent")
-            
-            choice = Prompt.ask(
-                "Choose an option",
-                choices=[str(i) for i in range(1, len(existing_dbs) + 1)] + ['n'],
-                default="n"
-            )
-            
-            if choice == 'n':
-                # Create new agent with new database
-                db_name = Prompt.ask("\nEnter name for new agent database", default="new_agent.db")
-                if not db_name.endswith('.db'):
-                    db_name += '.db'
-                agent = ThinkingAgent(client, db_path=db_name)
-                
-                # Configure new agent
-                console.print("\n[bold cyan]Let's configure your new AI agent![/bold cyan]")
-                configure_new_agent(agent)
-            else:
-                # Load existing agent
-                db_path = existing_dbs[int(choice) - 1]
-                agent = ThinkingAgent(client, db_path=db_path)
-                
-                if agent.load_active_identity():
-                    console.print("\n[green]✓ Loaded existing agent configuration![/green]")
-                else:
-                    console.print("\n[yellow]No active configuration found. Let's create one![/yellow]")
-                    configure_new_agent(agent)
-        else:
-            # No existing databases, create new
-            console.print("\n[cyan]Creating new agent...[/cyan]")
-            agent = ThinkingAgent(client)
+        db_path, is_new = choose_agent_database()
+        agent = ThinkingAgent(None, db_path=db_path)
+        setup_provider(agent)
+
+        if is_new:
+            console.print("\n[bold cyan]Let's configure your new AI agent![/bold cyan]")
             configure_new_agent(agent)
-        
+        elif agent.load_active_identity():
+            console.print("\n[green]✓ Loaded existing agent configuration![/green]")
+        else:
+            console.print("\n[yellow]No active configuration found. Let's create one![/yellow]")
+            configure_new_agent(agent)
+
         return agent
-        
+
     except Exception as e:
         console.print(f"\n[red]✗ Error: {str(e)}[/red]")
         return None

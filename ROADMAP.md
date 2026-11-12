@@ -81,6 +81,24 @@ the vendors' official pricing pages, set `default_model` /
 `default_light_model` on `OpenAIProvider` and `GeminiProvider` in
 `providers.py`, as `AnthropicProvider` does.
 
+## 5. Autonomous self-evaluation and development
+
+**Design principle.** Growing Agent is responsible for directing and evaluating its own development. The user may define an agent's initial purpose and constraints, but the agent should identify what progress means in relation to that purpose, devise ways to measure it, and revise those measures as its understanding evolves. Progress measurement is part of the agent's autonomy, not a developer-administered scorecard.
+
+**Current state.** The agent generates reflection prompts, scores their effectiveness, stores scores, and uses high- and low-scoring prompts when generating future reflections. This is a starting feedback loop, not yet a general system for measuring development. Its reflection-scoring rubric is currently fixed in code, and a score is the agent's assessment rather than independently established proof of progress.
+
+**Planned capabilities.**
+1. **Self-directed objectives.** From its configured purpose and accumulated experience, identify concrete goals, priorities, limitations, and opportunities for development.
+2. **Self-generated measures.** Decide what observable evidence would indicate progress toward each objective. Define a baseline, expected change, and measurement method; revise these when experience shows they are inadequate.
+3. **Hypotheses and experiments.** Propose changes to strategies, knowledge structures, or methods; state the expected benefit; test and compare outcomes.
+4. **Evidence-based judgments.** Record observations and measurements separately from predictions, interpretations, and self-assigned scores. Preserve unsuccessful and inconclusive results, not just successes.
+5. **Evolving evaluation.** Reflect on whether its chosen measurements genuinely correspond to its purpose, and improve the evaluation method itself when warranted.
+6. **Persistent development history.** Preserve objectives, hypotheses, baselines, measurement definitions, experiments, results, lessons, and revisions so the agent can trace why it believes it has improved or regressed.
+
+**What would count as progress?** An observed change in the agent's ability to achieve something relevant to its purpose, compared with an earlier baseline, with supporting evidence the agent can inspect and reassess. More thoughts, database entries, or high self-ratings alone do not establish improvement. The agent should also be able to recognize when evidence is insufficient.
+
+**Relationship to existing issues.** The separate-grader and measured-signal options in section 2 can improve the reliability of reflection scores, but they do not replace the broader autonomous evaluation process described here. Database safety and sustainable running costs in sections 1 and 3 remain prerequisites for reliable long-term experimentation.
+
 ## Not planned: Cursor as an engine
 
 Cursor is an editor, not a model provider. It has no general-purpose
